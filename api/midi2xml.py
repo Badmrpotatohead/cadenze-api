@@ -1,7 +1,7 @@
 from http.server import BaseHTTPRequestHandler
 import os, tempfile, traceback
 try:
-    from music21 import converter, environment, stream, instrument
+    from music21 import converter, environment, stream, note, chord, instrument
     us = environment.UserSettings()
     us['musicxmlPath'] = ''
     us['musescoreDirectPNGPath'] = ''
@@ -9,52 +9,44 @@ try:
 except Exception as e:
     READY = False
     READY_ERR = str(e)
-def midi_to_grand_staff(score):
-    """Reduce a multi-part score to a 2-part piano grand staff."""
+SPLIT_MIDI = 60  # C4 — notes >= 60 go treble, < 60 go bass
+def to_grand_staff(score):
     try:
-        # Collect all notes/chords from all parts into treble and bass
-        treble_part = stream.Part()
-        bass_part = stream.Part()
-
-        treble_part.insert(0, instrument.Piano())
-        bass_part.insert(0, instrument.Piano())
-        # Split notes by pitch: C4 (midi 60) and above → treble, below → bass
-        SPLIT = 60
-        all_notes = []
+        treble = stream.Part()
+        bass = stream.Part()
+        treble.insert(0, instrument.Piano())
+        bass.insert(0, instrument.Piano())
+        # Copy time/key signatures from first part
+        first = score.parts[0] if score.parts else None
+        if first:
+            for el in first.flatten().getElementsByClass(['TimeSignature','KeySignature']):
+                treble.insert(el.offset, el)
+                bass.insert(el.offset, el)
+        # Collect all notes from all parts
         for part in score.parts:
             for el in part.flatten().notesAndRests:
-                all_notes.append(el)
-        # Sort by offset
-        all_notes.sort(key=lambda n: float(n.offset))
-        for el in all_notes:
-            from music21 import note, chord
-            if isinstance(el, note.Rest):
-                treble_part.append(el)
-            elif isinstance(el, note.Note):
-                if el.pitch.midi >= SPLIT:
-                    treble_part.append(el)
-                else:
-                    bass_part.append(el)
-            elif isinstance(el, chord.Chord):
-                # Split chord: high notes treble, low notes bass
-                treble_notes = [n for n in el.notes if n.pitch.midi >= SPLIT]
-                bass_notes   = [n for n in el.notes if n.pitch.midi < SPLIT]
-                if treble_notes:
-                    c = chord.Chord(treble_notes, quarterLength=el.quarterLength)
-                    c.offset = el.offset
-                    treble_part.append(c)
-                if bass_notes:
-                    c = chord.Chord(bass_notes, quarterLength=el.quarterLength)
-                    c.offset = el.offset
-                    bass_part.append(c)
-        grand = stream.Score()
-        grand.insert(0, treble_part)
-        grand.insert(0, bass_part)
-        return grand
+                if isinstance(el, note.Rest):
+                    pass  # skip rests, music21 will fill
+                elif isinstance(el, note.Note):
+                    target = treble if el.pitch.midi >= SPLIT_MIDI else bass
+                    n = note.Note(el.pitch, quarterLength=el.quarterLength)
+                    target.insert(el.offset, n)
+                elif isinstance(el, chord.Chord):
+                    hi = [p for p in el.pitches if p.midi >= SPLIT_MIDI]
+                    lo = [p for p in el.pitches if p.midi < SPLIT_MIDI]
+                    if hi:
+                        c = chord.Chord(hi, quarterLength=el.quarterLength)
+                        treble.insert(el.offset, c)
+                    if lo:
+                        c = chord.Chord(lo, quarterLength=el.quarterLength)
+                        bass.insert(el.offset, c)
+        out = stream.Score()
+        out.insert(0, treble)
+        out.insert(0, bass)
+        return out
     except Exception as e:
-        # If reduction fails, return original score
-        print(f'Grand staff reduction failed: {e}, returning original')
-        return score
+        print(f'to_grand_staff failed: {e}')
+        return score  # fallback to original
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
@@ -75,11 +67,8 @@ class handler(BaseHTTPRequestHandler):
                 tmp_mid = f.name
             tmp_xml = tmp_mid.replace('.mid', '.musicxml')
             try:
-                # Parse MIDI
                 score = converter.parse(tmp_mid)
-                # Reduce to grand staff (treble + bass)
-                score = midi_to_grand_staff(score)
-                # Write MusicXML
+                score = to_grand_staff(score)
                 score.write('musicxml', fp=tmp_xml)
                 with open(tmp_xml, 'r', encoding='utf-8') as f:
                     xml = f.read()

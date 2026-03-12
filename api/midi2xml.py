@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler
 import os, tempfile, traceback
+from urllib.parse import urlparse, parse_qs
 try:
     from music21 import converter, environment, stream, note, chord, instrument
     us = environment.UserSettings()
@@ -10,20 +11,26 @@ except Exception as e:
     READY = False
     READY_ERR = str(e)
 SPLIT_MIDI = 60  # C4 — notes >= 60 go treble, < 60 go bass
-def to_grand_staff(score):
+def to_grand_staff(score, track_filter=None):
     try:
         treble = stream.Part()
         bass = stream.Part()
         treble.insert(0, instrument.Piano())
         bass.insert(0, instrument.Piano())
+        # Apply track filter (by index); fallback to all parts if filter yields nothing
+        parts = score.parts
+        if track_filter is not None:
+            filtered = [parts[i] for i in track_filter if i < len(parts)]
+            if filtered:
+                parts = filtered
         # Copy time/key signatures from first part
-        first = score.parts[0] if score.parts else None
+        first = parts[0] if parts else None
         if first:
             for el in first.flatten().getElementsByClass(['TimeSignature','KeySignature']):
                 treble.insert(el.offset, el)
                 bass.insert(el.offset, el)
-        # Collect all notes from all parts
-        for part in score.parts:
+        # Collect all notes from selected parts
+        for part in parts:
             for el in part.flatten().notesAndRests:
                 if isinstance(el, note.Rest):
                     pass  # skip rests, music21 will fill
@@ -57,6 +64,15 @@ class handler(BaseHTTPRequestHandler):
             self._err(500, f'music21 not available: {READY_ERR}')
             return
         try:
+            # Parse optional ?tracks=0,1,2 query param
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            track_filter = None
+            if 'tracks' in qs:
+                try:
+                    track_filter = [int(t) for t in qs['tracks'][0].split(',') if t.strip().lstrip('-').isdigit() and int(t) >= 0]
+                except Exception:
+                    track_filter = None
             length = int(self.headers.get('Content-Length', 0))
             midi_bytes = self.rfile.read(length)
             if not midi_bytes or midi_bytes[:4] != b'MThd':
@@ -68,7 +84,7 @@ class handler(BaseHTTPRequestHandler):
             tmp_xml = tmp_mid.replace('.mid', '.musicxml')
             try:
                 score = converter.parse(tmp_mid)
-                score = to_grand_staff(score)
+                score = to_grand_staff(score, track_filter)
                 score.write('musicxml', fp=tmp_xml)
                 with open(tmp_xml, 'r', encoding='utf-8') as f:
                     xml = f.read()
